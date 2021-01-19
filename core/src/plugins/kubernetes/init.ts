@@ -37,8 +37,6 @@ import { V1Secret, V1Toleration } from "@kubernetes/client-node"
 import { KubernetesResource } from "./types"
 import { compareDeployedResources } from "./status/status"
 import { PrimitiveMap } from "../../config/common"
-import { LogEntry } from "../../logger/log-entry"
-import { PluginContext } from "../../plugin-context"
 
 // Note: We need to increment a version number here if we ever make breaking changes to the NFS provisioner StatefulSet
 const nfsStorageClassVersion = 2
@@ -48,17 +46,6 @@ const dockerAuthDocsLink = `
 See https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/ for how to create
 a registry auth secret.
 `
-
-// Used to automatically support GCR auth on GKE.
-// Users can override by setting other values for any of these keys in any of their imagePullSecrets.
-const defaultCredHelpers = {
-  "asia.gcr.io": "gcr",
-  "eu.gcr.io": "gcr",
-  "gcr.io": "gcr",
-  "marketplace.gcr.io": "gcr",
-  "staging-k8s.gcr.io": "gcr",
-  "us.gcr.io": "gcr",
-}
 
 interface KubernetesProviderOutputs extends PrimitiveMap {
   "app-namespace": string
@@ -168,7 +155,7 @@ export async function getEnvironmentStatus({
   let secretsUpToDate = true
 
   if (provider.config.buildMode !== "local-docker") {
-    const authSecret = await prepareDockerAuth(api, ctx, provider, log)
+    const authSecret = await prepareDockerAuth(api, provider, systemNamespace)
     const comparison = await compareDeployedResources(k8sCtx, api, systemNamespace, [authSecret], log)
     secretsUpToDate = comparison.state === "ready"
   }
@@ -294,7 +281,7 @@ export async function prepareSystem({
   // Set auth secret for in-cluster builder
   if (provider.config.buildMode !== "local-docker") {
     log.info("Updating builder auth secret")
-    const authSecret = await prepareDockerAuth(sysApi, ctx, sysProvider, log)
+    const authSecret = await prepareDockerAuth(sysApi, sysProvider, systemNamespace)
     await sysApi.upsert({ kind: "Secret", namespace: systemNamespace, obj: authSecret, log })
   }
 
@@ -490,7 +477,7 @@ export async function buildDockerAuthConfig(
         throw new ConfigurationError(
           dedent`
         Could not parse configured imagePullSecret '${secret.metadata.name}' as a valid docker authentication file,
-        because it is missing an "auths", "credHelpers" key.
+        because it is missing an "auths" or "credHelpers" key.
         ${dockerAuthDocsLink}
         `,
           { secretRef }
@@ -502,29 +489,24 @@ export async function buildDockerAuthConfig(
         credHelpers: { ...accumulator.credHelpers, ...decoded.credHelpers },
       }
     },
-    { experimental: "enabled", auths: {}, credHelpers: defaultCredHelpers }
+    { experimental: "enabled", auths: {}, credHelpers: {} }
   )
 }
 
 export async function prepareDockerAuth(
   api: KubeApi,
-  ctx: PluginContext,
   provider: KubernetesProvider,
-  log: LogEntry
+  namespace: string
 ): Promise<KubernetesResource<V1Secret>> {
   // Read all configured imagePullSecrets and combine into a docker config file to use in the in-cluster builders.
   const config = await buildDockerAuthConfig(provider.config.imagePullSecrets, api)
-
-  // Enabling experimental features, in order to support advanced registry querying
-  // Store the config as a Secret (overwriting if necessary)
-  const systemNamespace = await getSystemNamespace(ctx, provider, log, api)
 
   return {
     apiVersion: "v1",
     kind: "Secret",
     metadata: {
       name: dockerAuthSecretName,
-      namespace: systemNamespace,
+      namespace,
     },
     data: {
       [dockerAuthSecretKey]: Buffer.from(JSON.stringify(config)).toString("base64"),
